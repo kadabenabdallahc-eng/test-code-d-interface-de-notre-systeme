@@ -1,0 +1,959 @@
+import face_recognition
+import pickle
+import cv2
+import time
+import os
+import datetime
+import smtplib
+import threading
+import math
+import numpy as np
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext, simpledialog
+from PIL import Image, ImageTk
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.image import MIMEImage
+
+# --- CONFIGURATION GPIO ---
+try:
+    import RPi.GPIO as GPIO
+    IS_RASPBERRY_PI = True
+except ImportError:
+    IS_RASPBERRY_PI = False
+    print("[WARN] RPi.GPIO not found. Running in SIMULATION mode for GPIO.")
+
+LED_ROUGE = 17
+LED_VERT = 27
+BUZZER = 22
+
+# --- CONFIGURATION EMAIL ---
+EMAIL_SENDER = "hadilchb1@gmail.com"
+EMAIL_PASSWORD = "gsbc phow htoh uron"
+EMAIL_RECEIVER = "aboussaid110@gmail.com"
+
+# --- CONFIGURATION DOSSIERS ---
+CAPTURES_DIR = "captures_intrusion"
+DATASET_DIR = "known_faces"
+ENCODING_FILE = "encodingss.pickle"
+
+class SurveillanceApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Système de Surveillance - Modes Séparés")
+        self.root.geometry("1350x780")
+        self.root.configure(bg='#2c3e50')
+
+        # --- STYLE ---
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure("TNotebook", background='#2c3e50', borderwidth=0)
+        style.configure("TNotebook.Tab", background='#34495e', foreground='white', padding=[15, 10], font=('Helvetica', 10, 'bold'))
+        style.map("TNotebook.Tab", background=[("selected", '#3498db')])
+        style.configure("Treeview", background="#ecf0f1", foreground="#2c3e50", rowheight=25, fieldbackground="#ecf0f1")
+        style.configure("Treeview.Heading", background='#34495e', foreground='white', font=('Helvetica', 10, 'bold'))
+        style.map("Treeview", background=[("selected", '#3498db')])
+
+        # --- VARIABLES ---
+        self.is_running = False
+        self.cap = None
+        self.video_thread = None
+        self.zones = [] 
+        
+        # Mode de détection : 'HUMAIN' ou 'OBJET'
+        self.mode = tk.StringVar(value="HUMAIN")
+
+        # Données Visages
+        self.data = None 
+        self.detector = None
+        self.active_persons = {} 
+        self.next_person_id = 0
+
+        # Données Objets
+        self.tracked_objects = [] 
+        self.object_counter = 0
+
+        self.frame_counter = 0
+        self.alert_history_data = []
+        
+        # États Alertes
+        self.in_intrusion_zone = False
+        self.email_sent_for_current_intrusion = False
+        self.alert_physical_active = False
+        self.green_light_start_time = 0
+        
+        # --- NOUVEAU: Flags pour arrêt manuel ---
+        self.manual_stop_buzzer = False
+        self.manual_stop_red_led = False
+        self.manual_stop_green_led = False
+
+        # Setup
+        self.setup_gpio()
+        self.setup_gui()
+        self.load_system_data()
+        
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def setup_gpio(self):
+        if IS_RASPBERRY_PI:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setup(LED_ROUGE, GPIO.OUT)
+            GPIO.setup(LED_VERT, GPIO.OUT)
+            GPIO.setup(BUZZER, GPIO.OUT)
+            self.gpio_output(LED_ROUGE, False)
+            self.gpio_output(LED_VERT, False)
+            self.gpio_output(BUZZER, False)
+
+    def gpio_output(self, pin, state):
+        if IS_RASPBERRY_PI:
+            GPIO.output(pin, GPIO.HIGH if state else GPIO.LOW)
+
+    def setup_gui(self):
+        # --- Main Frames ---
+        self.main_frame = tk.Frame(self.root, bg='#2c3e50')
+        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Left Panel (Video)
+        self.video_frame = tk.LabelFrame(self.main_frame, text="🎥 Surveillance en direct", bg='#34495e', fg='white', font=('Helvetica', 12, 'bold'))
+        self.video_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+        self.video_label = tk.Label(self.video_frame, bg='#2c3e50')
+        self.video_label.pack(padx=5, pady=5, expand=True, fill=tk.BOTH)
+
+        # Right Panel
+        self.right_panel = tk.Frame(self.main_frame, bg='#2c3e50', width=420)
+        self.right_panel.pack(side=tk.RIGHT, fill=tk.Y)
+        self.right_panel.pack_propagate(False)
+
+        # --- NOTEBOOK (TABS) ---
+        self.notebook = ttk.Notebook(self.right_panel)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        # TAB 1: CONTROLS
+        self.tab_control = tk.Frame(self.notebook, bg='#34495e')
+        self.notebook.add(self.tab_control, text="⚙️ Surveiller")
+
+        # --- SÉLECTEUR DE MODE ---
+        self.mode_frame = tk.LabelFrame(self.tab_control, text="🔧 Mode de Détection", bg='#34495e', fg='white', font=('Helvetica', 10, 'bold'))
+        self.mode_frame.pack(fill=tk.X, pady=10, padx=10)
+        
+        rb_humain = tk.Radiobutton(self.mode_frame, text="👤 Mode HUMAIN (Reconnaissance Visage)", variable=self.mode, value="HUMAIN", 
+                                    bg='#34495e', fg='white', selectcolor='#2c3e50', font=('Helvetica', 10, 'bold'), command=self.update_ui_for_mode)
+        rb_humain.pack(anchor='w', padx=10, pady=5)
+        
+        rb_objet = tk.Radiobutton(self.mode_frame, text="📦 Mode OBJET (Suivi Manuel)", variable=self.mode, value="OBJET", 
+                                  bg='#34495e', fg='white', selectcolor='#2c3e50', font=('Helvetica', 10, 'bold'), command=self.update_ui_for_mode)
+        rb_objet.pack(anchor='w', padx=10, pady=5)
+
+        # Status Section
+        self.status_frame = tk.LabelFrame(self.tab_control, text="📊 État du Système", bg='#34495e', fg='white', font=('Helvetica', 10, 'bold'))
+        self.status_frame.pack(fill=tk.X, pady=10, padx=10)
+        self.lbl_status = tk.Label(self.status_frame, text="⚫ ARRÊT", bg='#34495e', fg='#e74c3c', font=('Helvetica', 14, 'bold'))
+        self.lbl_status.pack(pady=5)
+        
+        self.stats_frame = tk.Frame(self.status_frame, bg='#34495e')
+        self.stats_frame.pack(fill=tk.X, padx=10, pady=5)
+        tk.Label(self.stats_frame, text="Photos stockées:", bg='#34495e', fg='white').grid(row=0, column=0, sticky='w')
+        self.lbl_photo_count = tk.Label(self.stats_frame, text="0", bg='#34495e', fg='#3498db', font=('Helvetica', 10, 'bold'))
+        self.lbl_photo_count.grid(row=0, column=1, sticky='e', padx=10)
+        tk.Label(self.stats_frame, text="Intrusions:", bg='#34495e', fg='white').grid(row=1, column=0, sticky='w')
+        self.lbl_intrusion_count = tk.Label(self.stats_frame, text="0", bg='#34495e', fg='#e74c3c', font=('Helvetica', 10, 'bold'))
+        self.lbl_intrusion_count.grid(row=1, column=1, sticky='e', padx=10)
+
+        # Buttons Control
+        self.ctrl_frame = tk.LabelFrame(self.tab_control, text="Actions", bg='#34495e', fg='white', font=('Helvetica', 10, 'bold'))
+        self.ctrl_frame.pack(fill=tk.X, pady=10, padx=10)
+
+        self.btn_start = tk.Button(self.ctrl_frame, text="▶️ Démarrer", command=self.start_surveillance, bg='#27ae60', fg='white', font=('Helvetica', 10, 'bold'), relief=tk.FLAT, cursor="hand2")
+        self.btn_start.pack(fill=tk.X, padx=10, pady=5)
+        
+        self.btn_stop = tk.Button(self.ctrl_frame, text="⏹️ Arrêter", command=self.stop_surveillance, bg='#c0392b', fg='white', font=('Helvetica', 10, 'bold'), relief=tk.FLAT, state=tk.DISABLED, cursor="hand2")
+        self.btn_stop.pack(fill=tk.X, padx=10, pady=5)
+        
+        # Bouton Commun : Zones
+        self.btn_zones = tk.Button(self.ctrl_frame, text="📐 Configurer Zones (Alarme)", command=self.config_zones_gui, bg='#2980b9', fg='white', font=('Helvetica', 10, 'bold'), relief=tk.FLAT, cursor="hand2")
+        self.btn_zones.pack(fill=tk.X, padx=10, pady=5)
+
+        # Bouton Mode Humain : Visages
+        self.btn_train = tk.Button(self.ctrl_frame, text="⚡ Entraîner Modèle (Visages)", command=self.start_training_thread, bg='#8e44ad', fg='white', font=('Helvetica', 10, 'bold'), relief=tk.FLAT, cursor="hand2")
+        self.btn_train.pack(fill=tk.X, padx=10, pady=5)
+
+        # Bouton Mode Objet : Tracker
+        self.btn_objects = tk.Button(self.ctrl_frame, text="📦 Configurer Objets (Tracker)", command=self.configure_tracked_objects, bg='#e67e22', fg='white', font=('Helvetica', 10, 'bold'), relief=tk.FLAT, cursor="hand2")
+        self.btn_objects.pack(fill=tk.X, padx=10, pady=5)
+
+        # --- NOUVEAU : SECTION CONTRÔLE MANUEL HARDWARE ---
+        self.hw_frame = tk.LabelFrame(self.tab_control, text="🔧 Contrôle Manuel (Hardware)", bg='#34495e', fg='white', font=('Helvetica', 10, 'bold'))
+        self.hw_frame.pack(fill=tk.X, pady=10, padx=10)
+
+        self.btn_stop_all = tk.Button(self.hw_frame, text="🆘 STOP ALARME (Tout Éteindre)", command=self.manual_stop_all, bg='#e74c3c', fg='white', font=('Helvetica', 11, 'bold'), relief=tk.FLAT, cursor="hand2")
+        self.btn_stop_all.pack(fill=tk.X, padx=10, pady=5)
+
+        # Sous-frame pour les boutons individuels
+        self.hw_btns_frame = tk.Frame(self.hw_frame, bg='#34495e')
+        self.hw_btns_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        self.btn_stop_red = tk.Button(self.hw_btns_frame, text="🔴 Stop LED Rouge", command=self.manual_stop_red, bg='#95a5a6', fg='white', font=('Helvetica', 9, 'bold'), relief=tk.FLAT)
+        self.btn_stop_red.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+
+        self.btn_stop_green = tk.Button(self.hw_btns_frame, text="🟢 Stop LED Vert", command=self.manual_stop_green, bg='#95a5a6', fg='white', font=('Helvetica', 9, 'bold'), relief=tk.FLAT)
+        self.btn_stop_green.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+
+        self.btn_stop_buzzer = tk.Button(self.hw_btns_frame, text="🔊 Stop Buzzer", command=self.manual_stop_buzzer, bg='#95a5a6', fg='white', font=('Helvetica', 9, 'bold'), relief=tk.FLAT)
+        self.btn_stop_buzzer.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        # ---------------------------------------------------
+
+        # Logs
+        self.log_frame = tk.LabelFrame(self.tab_control, text="📜 Journal Live", bg='#34495e', fg='white', font=('Helvetica', 10, 'bold'))
+        self.log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.log_area = scrolledtext.ScrolledText(self.log_frame, width=40, height=6, bg='#ecf0f1', fg='#2c3e50', font=('Consolas', 8))
+        self.log_area.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.log_area.configure(state='disabled')
+
+        # TAB 2: FACE MANAGEMENT
+        self.tab_faces = tk.Frame(self.notebook, bg='#34495e')
+        self.notebook.add(self.tab_faces, text="👤 Visages")
+        
+        self.cam_frame = tk.LabelFrame(self.tab_faces, text="📷 Test Caméra", bg='#34495e', fg='white', font=('Helvetica', 10, 'bold'))
+        self.cam_frame.pack(fill=tk.X, pady=10, padx=10)
+        self.btn_test_cam = tk.Button(self.cam_frame, text="Tester la Caméra", command=self.test_camera, bg='#8e44ad', fg='white', font=('Helvetica', 10, 'bold'), relief=tk.FLAT)
+        self.btn_test_cam.pack(fill=tk.X, padx=10, pady=5)
+        self.lbl_cam_status = tk.Label(self.cam_frame, text="Statut: Non testé", bg='#34495e', fg='white')
+        self.lbl_cam_status.pack(pady=5)
+
+        self.add_frame = tk.LabelFrame(self.tab_faces, text="➕ Ajouter Personne", bg='#34495e', fg='white', font=('Helvetica', 10, 'bold'))
+        self.add_frame.pack(fill=tk.X, pady=10, padx=10)
+        tk.Label(self.add_frame, text="Nom:", bg='#34495e', fg='white').pack(anchor='w', padx=10)
+        self.entry_name = tk.Entry(self.add_frame, font=('Helvetica', 12))
+        self.entry_name.pack(fill=tk.X, padx=10, pady=5)
+        self.btn_capture = tk.Button(self.add_frame, text="📸 Prendre Photos (Popup)", command=self.open_capture_window, bg='#16a085', fg='white', font=('Helvetica', 10, 'bold'), relief=tk.FLAT)
+        self.btn_capture.pack(fill=tk.X, padx=10, pady=5)
+
+        # TAB 3: HISTORY
+        self.tab_history = tk.Frame(self.notebook, bg='#34495e')
+        self.notebook.add(self.tab_history, text="📜 Historique")
+        self.history_tree_frame = tk.Frame(self.tab_history, bg='#34495e')
+        self.history_tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        columns = ("Date", "Nom", "Zone", "Type", "Image")
+        self.history_tree = ttk.Treeview(self.history_tree_frame, columns=columns, show="headings")
+        self.history_tree.heading("Date", text="📅 Date")
+        self.history_tree.heading("Nom", text="👤 Nom")
+        self.history_tree.heading("Zone", text="📍 Zone")
+        self.history_tree.heading("Type", text="⚠️ Type")
+        self.history_tree.heading("Image", text="🖼️ Fichier")
+        self.history_tree.column("Date", width=130)
+        self.history_tree.column("Nom", width=80)
+        self.history_tree.column("Zone", width=80)
+        self.history_tree.column("Type", width=90)
+        self.history_tree.column("Image", width=100)
+        self.history_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar = ttk.Scrollbar(self.history_tree_frame, orient=tk.VERTICAL, command=self.history_tree.yview)
+        self.history_tree.configure(yscroll=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Initialiser l'état de l'interface
+        self.update_ui_for_mode()
+
+    # --- NOUVELLES FONCTIONS DE CONTROLE MANUEL ---
+    def manual_stop_all(self):
+        """Arrête toutes les alarmes (LEDs + Buzzer) et désactive l'alerte automatique"""
+        self.log_message("🛑 Arrêt manuel total (Hardware) demandé.")
+        self.alert_physical_active = False # Stop la boucle d'alerte
+        
+        # Forcer l'arrêt
+        self.gpio_output(LED_ROUGE, False)
+        self.gpio_output(LED_VERT, False)
+        self.gpio_output(BUZZER, False)
+        
+        # Réinitialiser les flags d'intrusion pour permettre une nouvelle détection propre
+        self.in_intrusion_zone = False
+        self.email_sent_for_current_intrusion = False
+        
+        # Reset override flags
+        self.manual_stop_buzzer = False
+        self.manual_stop_red_led = False
+        self.manual_stop_green_led = False
+        
+        if self.is_running:
+             self.lbl_status.config(text=f"🟢 ACTIF ({self.mode.get()})", fg='#2ecc71')
+
+    def manual_stop_red(self):
+        """Arrête seulement la LED Rouge"""
+        self.log_message("🔴 Arrêt manuel LED Rouge.")
+        self.gpio_output(LED_ROUGE, False)
+        self.manual_stop_red_led = True
+
+    def manual_stop_green(self):
+        """Arrête seulement la LED Verte"""
+        self.log_message("🟢 Arrêt manuel LED Verte.")
+        self.gpio_output(LED_VERT, False)
+        self.manual_stop_green_led = True
+
+    def manual_stop_buzzer(self):
+        """Arrête seulement le Buzzer"""
+        self.log_message("🔊 Arrêt manuel Buzzer.")
+        self.gpio_output(BUZZER, False)
+        self.manual_stop_buzzer = True
+    # ----------------------------------------------
+
+    def update_ui_for_mode(self):
+        """Active/Désactive les boutons selon le mode choisi"""
+        mode = self.mode.get()
+        if mode == "HUMAIN":
+            self.btn_objects.config(state=tk.DISABLED)
+            self.btn_train.config(state=tk.NORMAL)
+            self.btn_zones.config(state=tk.NORMAL)
+        else: # OBJET
+            self.btn_objects.config(state=tk.NORMAL)
+            self.btn_train.config(state=tk.DISABLED)
+            self.btn_zones.config(state=tk.NORMAL)
+
+    # --- LOGIC: CAMERA & CAPTURE ---
+    def test_camera(self):
+        self.log_message("Test caméra...")
+        temp_cap = cv2.VideoCapture(0)
+        if temp_cap.isOpened():
+            ret, _ = temp_cap.read()
+            if ret:
+                self.lbl_cam_status.config(text="Statut: ✅ OK", fg='#2ecc71')
+                self.log_message("✅ Caméra OK.")
+            else:
+                self.lbl_cam_status.config(text="Statut: ⚠️ Erreur", fg='#e74c3c')
+            temp_cap.release()
+        else:
+            self.lbl_cam_status.config(text="Statut: ❌ Erreur", fg='#e74c3c')
+
+    def open_capture_window(self):
+        name = self.entry_name.get().strip()
+        if not name:
+            messagebox.showwarning("Info", "Entrez un nom.")
+            return
+        if self.is_running:
+            self.stop_surveillance()
+            time.sleep(0.5)
+        CaptureWindow(self, name)
+
+    # --- LOGIC: OBJECT TRACKING CONFIGURATION ---
+    def configure_tracked_objects(self):
+        """Ouvre une fenêtre OpenCV pour sélectionner manuellement des objets à suivre"""
+        if self.is_running:
+            self.stop_surveillance()
+            time.sleep(0.5)
+
+        temp_cap = cv2.VideoCapture(0)
+        if not temp_cap.isOpened():
+            messagebox.showerror("Erreur", "Impossible d'ouvrir la caméra")
+            return
+
+        self.log_message("📦 Mode Config Objets: Dessinez sur l'image. 'Q' pour terminer, 'C' pour effacer.")
+        
+        drawing = False
+        start_point = (-1, -1)
+        end_point = (-1, -1)
+        frame_display = None
+
+        def draw_rectangle_callback(event, x, y, flags, param):
+            nonlocal drawing, start_point, end_point, frame_display
+            if event == cv2.EVENT_LBUTTONDOWN:
+                drawing = True
+                start_point = (x, y)
+                end_point = (x, y)
+            elif event == cv2.EVENT_MOUSEMOVE:
+                if drawing:
+                    end_point = (x, y)
+            elif event == cv2.EVENT_LBUTTONUP:
+                drawing = False
+                end_point = (x, y)
+                x1, y1 = start_point
+                x2, y2 = end_point
+                x_min, y_min = min(x1, x2), min(y1, y2)
+                w, h = abs(x2 - x1), abs(y2 - y1)
+
+                if w > 10 and h > 10:
+                    object_name = simpledialog.askstring("Nom de l'objet", "Entrez le nom de cet objet:", parent=self.root)
+                    if object_name:
+                        try:
+                            tracker = cv2.legacy.TrackerCSRT_create()
+                        except AttributeError:
+                            self.log_message("⚠️ Tracker CSRT indisponible, utilisation de KCF")
+                            tracker = cv2.TrackerKCF_create()
+
+                        if tracker.init(frame_display, (x_min, y_min, w, h)):
+                            self.tracked_objects.append({
+                                'tracker': tracker,
+                                'name': object_name,
+                                'bbox': (x_min, y_min, w, h),
+                                'color': (255, 140, 0),
+                                'id': self.object_counter
+                            })
+                            self.object_counter += 1
+                            self.log_message(f"📦 Objet '{object_name}' ajouté.")
+
+        cv2.namedWindow("Config Objets")
+        cv2.setMouseCallback("Config Objets", draw_rectangle_callback)
+
+        while True:
+            ret, frame = temp_cap.read()
+            if not ret: break
+            
+            frame = cv2.resize(frame, (640, 480))
+            frame = cv2.flip(frame, 1)
+            
+            frame_display = frame.copy()
+
+            for obj in self.tracked_objects:
+                x, y, w, h = [int(v) for v in obj['bbox']]
+                cv2.rectangle(frame_display, (x, y), (x+w, y+h), obj['color'], 2)
+                cv2.putText(frame_display, obj['name'], (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, obj['color'], 2)
+
+            if drawing:
+                cv2.rectangle(frame_display, start_point, end_point, (255, 255, 255), 2)
+
+            cv2.imshow("Config Objets", frame_display)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'): break
+            elif key == ord('c'): 
+                self.tracked_objects.clear()
+                self.log_message("🗑️ Objets supprimés.")
+
+        cv2.destroyWindow("Config Objets")
+        temp_cap.release()
+
+    # --- LOGIC: TRAINING ---
+    def start_training_thread(self):
+        threading.Thread(target=self.train_model_logic, daemon=True).start()
+
+    def train_model_logic(self):
+        self.root.after(0, lambda: self.btn_train.config(state=tk.DISABLED, text="⏳ Training..."))
+        self.log_message("🧠 Training...")
+        knownEncodings = []
+        knownNames = []
+        if not os.path.exists(DATASET_DIR): os.makedirs(DATASET_DIR)
+        
+        count = 0
+        for person_name in os.listdir(DATASET_DIR):
+            person_path = os.path.join(DATASET_DIR, person_name)
+            if os.path.isdir(person_path):
+                for img_name in os.listdir(person_path):
+                    if img_name.lower().endswith(('.jpg', '.jpeg', '.png')):
+                        img_path = os.path.join(person_path, img_name)
+                        try:
+                            image = cv2.imread(img_path)
+                            if image is None: continue
+                            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                            boxes = face_recognition.face_locations(rgb, model="hog")
+                            encodings = face_recognition.face_encodings(rgb, boxes)
+                            for enc in encodings:
+                                knownEncodings.append(enc)
+                                knownNames.append(person_name)
+                                count += 1
+                        except: pass
+
+        if count == 0:
+            self.log_message("❌ Aucun visage.")
+        else:
+            data = {"encodings": knownEncodings, "names": knownNames}
+            with open(ENCODING_FILE, "wb") as f: pickle.dump(data, f)
+            self.log_message(f"✅ Entraînement terminé: {count} visages.")
+            self.load_system_data()
+        
+        self.root.after(0, lambda: self.btn_train.config(state=tk.NORMAL, text="⚡ Entraîner Modèle (Visages)"))
+
+    def log_message(self, message):
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        self.log_area.configure(state='normal')
+        self.log_area.insert(tk.END, f"[{timestamp}] {message}\n")
+        self.log_area.see(tk.END)
+        self.log_area.configure(state='disabled')
+
+    def load_system_data(self):
+        try:
+            if os.path.exists(ENCODING_FILE):
+                with open(ENCODING_FILE, "rb") as f: self.data = pickle.loads(f.read())
+                self.log_message(f"✅ {len(self.data['names'])} visages chargés.")
+            else: self.log_message("⚠️ Pas de modèle de visage.")
+        except Exception as e: self.log_message(f"❌ Erreur: {e}")
+        
+        self.detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        if not os.path.exists(CAPTURES_DIR): os.makedirs(CAPTURES_DIR)
+        self.update_photo_count()
+
+    def start_surveillance(self):
+        if self.is_running: return
+        
+        mode = self.mode.get()
+        
+        if not self.zones:
+             messagebox.showwarning("Config", "Veuillez configurer au moins une zone d'alarme.")
+             return
+        
+        if mode == "HUMAIN":
+             if not self.data:
+                 messagebox.showwarning("Config", "Pas de modèle de visage. Entraînez le modèle d'abord.")
+                 return
+        elif mode == "OBJET":
+             if not self.tracked_objects:
+                 messagebox.showwarning("Config", "Aucun objet configuré. Configurez les objets d'abord.")
+                 return
+        
+        self.is_running = True
+        self.frame_counter = 0
+        self.btn_start.config(state=tk.DISABLED)
+        self.btn_stop.config(state=tk.NORMAL)
+        
+        self.btn_zones.config(state=tk.DISABLED)
+        self.btn_objects.config(state=tk.DISABLED)
+        self.btn_train.config(state=tk.DISABLED)
+        
+        self.lbl_status.config(text=f"🟢 ACTIF ({mode})", fg='#2ecc71')
+        self.active_persons = {}
+        
+        self.in_intrusion_zone = False
+        # Reset manual flags on start
+        self.manual_stop_buzzer = False
+        self.manual_stop_red_led = False
+        self.manual_stop_green_led = False
+
+        self.log_message(f"🚀 Démarré en Mode {mode}.")
+        self.video_thread = threading.Thread(target=self.video_loop)
+        self.video_thread.daemon = True
+        self.video_thread.start()
+
+    def stop_surveillance(self):
+        self.is_running = False
+        self.btn_start.config(state=tk.NORMAL)
+        self.btn_stop.config(state=tk.DISABLED)
+        self.lbl_status.config(text="⚫ ARRÊT", fg='#e74c3c')
+        self.stop_alerts()
+        self.log_message("⏹️ Arrêté.")
+        self.update_ui_for_mode()
+
+    def config_zones_gui(self):
+        if self.is_running:
+            self.stop_surveillance()
+            time.sleep(0.5)
+        
+        temp_cap = cv2.VideoCapture(0)
+        if not temp_cap.isOpened(): return
+        ret, frame = temp_cap.read()
+        if not ret: 
+            temp_cap.release()
+            return
+        
+        frame = cv2.resize(frame, (640, 480))
+        frame = cv2.flip(frame, 1)
+
+        self.zones = []
+        while True:
+            display = frame.copy()
+            for z in self.zones:
+                x,y,w,h = z['coords']
+                color = (0,0,255) if z['type'] == 'interdite' else (0,255,0)
+                cv2.rectangle(display, (x,y), (x+w,y+h), color, 2)
+            
+            roi = cv2.selectROI("Config Zones", display, False, False)
+            if roi[2] == 0 or roi[3] == 0: break
+            
+            type_zone = messagebox.askquestion("Type", "INTERDITE? (Non=Autorisée)")
+            z_type = "interdite" if type_zone == 'yes' else "autorisee"
+            self.zones.append({'coords': roi, 'type': z_type})
+            
+            if not messagebox.askyesno("Continuer", "Ajouter autre?"): break
+        
+        cv2.destroyWindow("Config Zones")
+        temp_cap.release()
+        self.log_message(f"✅ {len(self.zones)} zones configurées.")
+
+    def video_loop(self):
+        self.cap = cv2.VideoCapture(0)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        while self.is_running:
+            ret, frame = self.cap.read()
+            if not ret: continue
+            
+            frame = cv2.resize(frame, (640, 480))
+            
+            self.frame_counter += 1
+            frame = cv2.flip(frame, 1)
+            
+            try:
+                processed_frame = self.process_frame(frame)
+            except Exception as e:
+                print(f"Erreur process_frame: {e}")
+                processed_frame = frame
+
+            cv2image = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGBA)
+            img = Image.fromarray(cv2image)
+            imgtk = ImageTk.PhotoImage(image=img)
+            self.root.after(0, lambda i=imgtk: self.update_video_label(i))
+
+        if self.cap: self.cap.release()
+
+    def update_video_label(self, imgtk):
+        if self.is_running:
+            self.video_label.imgtk = imgtk
+            self.video_label.configure(image=imgtk)
+
+    def process_frame(self, frame):
+        current_mode = self.mode.get()
+        
+        intrusion_detected_now = False
+        intruder_name = "Inconnu"
+        
+        authorized_entry_detected = False
+        authorized_person_name = ""
+
+        frame = self.draw_zones(frame)
+
+        if current_mode == "HUMAIN":
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            updated_persons = {}
+            for person_id, person_data in self.active_persons.items():
+                tracker = person_data['tracker']
+                name = person_data['name']
+                success, box = tracker.update(frame)
+                
+                if success:
+                    (x, y, w, h) = [int(v) for v in box]
+                    person_data['bbox'] = (x, y, w, h)
+                    person_data['last_seen'] = time.time()
+                    updated_persons[person_id] = person_data
+                    
+                    is_unknown = (name == "Unknown")
+                    color = (0, 0, 255) if is_unknown else (0, 255, 0)
+                    cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+                    cv2.putText(frame, name, (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    
+                    for z in self.zones:
+                        if self.rectangle_touche_zone((x, y, w, h), z['coords']):
+                            if is_unknown:
+                                if z['type'] == 'interdite':
+                                    intrusion_detected_now = True
+                                    intruder_name = name
+                                    cv2.putText(frame, "INTRUSION!", (x, y-20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                            else:
+                                if not person_data.get('notified_entry', False):
+                                    authorized_entry_detected = True
+                                    authorized_person_name = name
+                                    person_data['notified_entry'] = True
+                                    cv2.putText(frame, "AUTORISE", (x, y-20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            self.active_persons = updated_persons
+            
+            current_time = time.time()
+            to_remove = [pid for pid, p in self.active_persons.items() if current_time - p['last_seen'] > 2.0]
+            for pid in to_remove: del self.active_persons[pid]
+
+            if self.frame_counter % 30 == 0:
+                try:
+                    rects = self.detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=6, minSize=(50, 50))
+                    for (x, y, w, h) in rects:
+                        already_tracked = False
+                        cx_det = x + w/2
+                        cy_det = y + h/2
+                        for p_data in self.active_persons.values():
+                            px, py, pw, ph = p_data['bbox']
+                            cx_trk = px + pw/2
+                            cy_trk = py + ph/2
+                            dist = math.sqrt( (cx_det - cx_trk)**2 + (cy_det - cy_trk)**2 )
+                            if dist < 80: already_tracked = True; break
+                        
+                        if not already_tracked:
+                            tracker = cv2.TrackerKCF_create()
+                            body_x = max(0, x - w//2)
+                            body_y = max(0, y - h//4)
+                            body_w = min(frame.shape[1] - body_x, w * 2)
+                            body_h = min(frame.shape[0] - body_y, int(h * 2.5))
+                            tracker.init(frame, (body_x, body_y, body_w, body_h))
+                            pid = self.next_person_id
+                            self.active_persons[pid] = {
+                                'tracker': tracker, 
+                                'name': "Unknown", 
+                                'bbox': (body_x, body_y, body_w, body_h), 
+                                'last_seen': time.time(),
+                                'notified_entry': False
+                            }
+                            self.next_person_id += 1
+                            threading.Thread(target=self.recognize_face_thread, args=(rgb.copy(), (y, x+w, y+h, x), pid), daemon=True).start()
+                except: pass
+
+        elif current_mode == "OBJET":
+            for obj in self.tracked_objects:
+                tracker = obj['tracker']
+                try:
+                    success, box = tracker.update(frame)
+                except Exception:
+                    success = False 
+                
+                if success:
+                    x, y, w, h = [int(v) for v in box]
+                    obj['bbox'] = (x, y, w, h)
+                    
+                    color = obj['color']
+                    cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+                    cv2.putText(frame, f"[OBJ] {obj['name']}", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    
+                    for z in self.zones:
+                        if z['type'] == 'interdite':
+                            if self.rectangle_touche_zone((x, y, w, h), z['coords']):
+                                intrusion_detected_now = True
+                                intruder_name = obj['name']
+                                cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 0, 255), 3)
+                                cv2.putText(frame, "ALERTE OBJET!", (x, y-30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        # --- GESTION ALERTES ---
+
+        if authorized_entry_detected:
+            self.log_message(f"✅ Entrée autorisée: {authorized_person_name}")
+            threading.Thread(target=self.process_email_alert, 
+                            args=(authorized_person_name, "Zone Surveillée", None, True), daemon=True).start()
+
+        if intrusion_detected_now:
+            if not self.in_intrusion_zone:
+                self.log_message(f"⚠️ Intrusion détectée: {intruder_name}")
+                photo_path = self.generer_chemin_image()
+                cv2.imwrite(photo_path, frame)
+                self.root.after(0, self.update_photo_count)
+                
+                if not self.email_sent_for_current_intrusion:
+                    threading.Thread(target=self.process_email_alert, args=(intruder_name, "Zone Interdite", photo_path, False)).start()
+                    self.email_sent_for_current_intrusion = True
+                
+                self.in_intrusion_zone = True
+                self.start_alerts() 
+        else:
+            someone_in_red_zone = False
+            
+            if current_mode == "HUMAIN":
+                for p in self.active_persons.values():
+                    if p['name'] == "Unknown":
+                        for z in self.zones:
+                            if z['type'] == 'interdite' and self.rectangle_touche_zone(p['bbox'], z['coords']):
+                                someone_in_red_zone = True; break
+                    if someone_in_red_zone: break
+            elif current_mode == "OBJET":
+                for obj in self.tracked_objects:
+                    x, y, w, h = obj['bbox']
+                    for z in self.zones:
+                        if z['type'] == 'interdite' and self.rectangle_touche_zone((x, y, w, h), z['coords']):
+                            someone_in_red_zone = True; break
+                    if someone_in_red_zone: break
+
+            if not someone_in_red_zone:
+                if self.in_intrusion_zone:
+                    self.log_message("✅ Zone dégagée.")
+                    self.stop_alerts()
+                    
+                    # Allumer vert SEULEMENT si pas désactivé manuellement
+                    if not self.manual_stop_green_led:
+                        self.gpio_output(LED_VERT, True)
+                        
+                    self.in_intrusion_zone = False
+                    self.email_sent_for_current_intrusion = False
+                    self.green_light_start_time = time.time()
+
+        # Timeout LED Verte
+        if self.green_light_start_time != 0:
+            if time.time() - self.green_light_start_time > 3:
+                if not self.manual_stop_green_led:
+                    self.gpio_output(LED_VERT, False)
+                self.green_light_start_time = 0
+
+        return frame
+
+    def recognize_face_thread(self, rgb_image, box, person_id):
+        try:
+            encoding = face_recognition.face_encodings(rgb_image, [box])
+            if len(encoding) > 0 and self.data:
+                matches = face_recognition.compare_faces(self.data["encodings"], encoding[0], tolerance=0.45)
+                if True in matches:
+                    matchedIdxs = [i for (i, b) in enumerate(matches) if b]
+                    counts = {}
+                    for i in matchedIdxs:
+                        name = self.data["names"][i]
+                        counts[name] = counts.get(name, 0) + 1
+                    name = max(counts, key=counts.get)
+                    if person_id in self.active_persons:
+                        self.active_persons[person_id]['name'] = name
+                    self.root.after(0, lambda n=name: self.log_message(f"🆔 Identifié: {n}"))
+        except: pass
+
+    def process_email_alert(self, name, zone_id, image_path, is_known):
+        type_alerte = "information" if is_known else "intrusion"
+        self.envoyer_alerte_email(name, zone_id, image_path, type_alerte)
+        
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        img_name = os.path.basename(image_path) if image_path else "N/A"
+        history_entry = (timestamp, name, zone_id, type_alerte.upper(), img_name)
+        self.root.after(0, lambda: self.update_history_table(history_entry))
+
+    def update_history_table(self, entry):
+        self.history_tree.insert("", 0, values=entry)
+        self.alert_history_data.append(entry)
+        self.lbl_intrusion_count.config(text=str(len(self.alert_history_data)))
+
+    def start_alerts(self):
+        if not self.alert_physical_active:
+            self.alert_physical_active = True
+            self.root.after(0, lambda: self.lbl_status.config(text="🚨 ALERTE", fg='#e74c3c'))
+            if IS_RASPBERRY_PI:
+                threading.Thread(target=self.alert_loop_hardware, daemon=True).start()
+
+    def stop_alerts(self):
+        self.alert_physical_active = False
+        self.gpio_output(LED_ROUGE, False)
+        self.gpio_output(BUZZER, False)
+        if self.is_running:
+            mode = self.mode.get()
+            self.root.after(0, lambda: self.lbl_status.config(text=f"🟢 ACTIF ({mode})", fg='#2ecc71'))
+
+    def alert_loop_hardware(self):
+        """Boucle d'alerte modifiée pour respecter les overrides manuels"""
+        while self.alert_physical_active and IS_RASPBERRY_PI:
+            # Si l'utilisateur a demandé l'arrêt manuel, on ne fait rien dans la boucle
+            # Mais on laisse la boucle tourner pour savoir si l'alerte est toujours active
+            
+            # Allumer si pas désactivé manuellement
+            if not self.manual_stop_red_led:
+                GPIO.output(LED_ROUGE, True)
+            if not self.manual_stop_buzzer:
+                GPIO.output(BUZZER, True)
+            
+            time.sleep(0.3)
+            
+            # Eteindre (clignotement)
+            GPIO.output(LED_ROUGE, False)
+            GPIO.output(BUZZER, False)
+            time.sleep(0.3)
+
+    def rectangle_touche_zone(self, bbox, zone_coords, seuil=0.05):
+        x, y, w, h = bbox
+        zx, zy, zw, zh = zone_coords
+        ix1, iy1 = max(x, zx), max(y, zy)
+        ix2, iy2 = min(x+w, zx+zw), min(y+h, zy+zh)
+        if ix2 > ix1 and iy2 > iy1:
+            intersection = (ix2 - ix1) * (iy2 - iy1)
+            rect_area = w * h
+            if rect_area > 0: return (intersection / rect_area) >= seuil
+        return False
+
+    def draw_zones(self, frame):
+        overlay = frame.copy()
+        for z in self.zones:
+            x, y, w, h = z['coords']
+            color = (0, 0, 255) if z['type'] == 'interdite' else (0, 255, 0)
+            cv2.rectangle(overlay, (x, y), (x+w, y+h), color, -1)
+            cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+            label = "INTERDIT" if z['type'] == 'interdite' else "AUTORISE"
+            cv2.putText(frame, label, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        cv2.addWeighted(overlay, 0.2, frame, 0.8, 0, frame)
+        return frame
+
+    def generer_chemin_image(self):
+        return os.path.join(CAPTURES_DIR, f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_intrusion.jpg")
+
+    def update_photo_count(self):
+        count = len([f for f in os.listdir(CAPTURES_DIR) if f.endswith('.jpg')]) if os.path.exists(CAPTURES_DIR) else 0
+        self.lbl_photo_count.config(text=str(count))
+
+    def envoyer_alerte_email(self, nom, zone_id, image_path, type_alerte):
+        try:
+            sujet = f"ALERTE {type_alerte.upper()} - {nom}"
+            if type_alerte == "information":
+                corps = f"Information: {nom} est entré dans la zone '{zone_id}'.\nDate: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            else:
+                corps = f"ALERLE: Intrusion détectée par {nom} dans {zone_id}. Voir photo jointe."
+
+            msg = MIMEMultipart()
+            msg['Subject'] = sujet
+            msg['From'] = EMAIL_SENDER
+            msg['To'] = EMAIL_RECEIVER
+            msg.attach(MIMEText(corps, 'plain', 'utf-8'))
+            
+            if type_alerte != "information" and image_path and os.path.exists(image_path):
+                with open(image_path, 'rb') as f:
+                    img = MIMEImage(f.read())
+                    img.add_header('Content-Disposition', 'attachment', filename=os.path.basename(image_path))
+                    msg.attach(img)
+            
+            with smtplib.SMTP('smtp.gmail.com', 587) as server:
+                server.starttls()
+                server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+                server.send_message(msg)
+            self.log_message(f"✅ Email envoyé ({type_alerte}): {nom}")
+            return True
+        except Exception as e:
+            self.log_message(f"❌ Erreur Email: {e}")
+            return False
+
+    def on_closing(self):
+        self.stop_surveillance()
+        time.sleep(0.5)
+        if IS_RASPBERRY_PI: GPIO.cleanup()
+        self.root.destroy()
+
+class CaptureWindow:
+    def __init__(self, parent_app, name):
+        self.parent = parent_app
+        self.name = name
+        self.count = 0
+        self.window = tk.Toplevel(parent_app.root)
+        self.window.title(f"Capture: {name}")
+        self.window.geometry("600x500")
+        self.lbl_video = tk.Label(self.window)
+        self.lbl_video.pack(pady=10)
+        self.lbl_count = tk.Label(self.window, text="Photos: 0", font=('Helvetica', 14))
+        self.lbl_count.pack()
+        self.btn_save = tk.Button(self.window, text="📸 Sauvegarder (Espace)", command=self.save_photo, bg='#27ae60', fg='white')
+        self.btn_save.pack(pady=5)
+        self.btn_close = tk.Button(self.window, text="Fermer", command=self.close_window, bg='#c0392b', fg='white')
+        self.btn_close.pack(pady=5)
+        self.cap = cv2.VideoCapture(0)
+        self.running = True
+        self.window.bind('<space>', lambda e: self.save_photo())
+        self.window.protocol("WM_DELETE_WINDOW", self.close_window)
+        self.loop()
+
+    def loop(self):
+        if not self.running: return
+        ret, frame = self.cap.read()
+        if ret:
+            frame = cv2.flip(frame, 1)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = self.parent.detector.detectMultiScale(gray, 1.3, 5)
+            self.current_frame = frame
+            for (x,y,w,h) in faces:
+                cv2.rectangle(frame, (x,y), (x+w, y+h), (255, 0, 0), 2)
+                self.face_crop = frame[y:y+h, x:x+w]
+            cv2image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
+            img = Image.fromarray(cv2image)
+            imgtk = ImageTk.PhotoImage(image=img)
+            self.lbl_video.imgtk = imgtk
+            self.lbl_video.configure(image=imgtk)
+            self.window.after(10, self.loop)
+
+    def save_photo(self):
+        if hasattr(self, 'face_crop') and self.face_crop is not None:
+            person_dir = os.path.join(DATASET_DIR, self.name)
+            if not os.path.exists(person_dir): os.makedirs(person_dir)
+            self.count += 1
+            filename = f"{self.name}_{self.count}.jpg"
+            path = os.path.join(person_dir, filename)
+            cv2.imwrite(path, self.face_crop)
+            self.lbl_count.config(text=f"Photos: {self.count} ✅")
+            self.parent.log_message(f"📸 Photo sauvée: {filename}")
+        else: messagebox.showwarning("Attention", "Aucun visage détecté!")
+
+    def close_window(self):
+        self.running = False
+        if self.cap: self.cap.release()
+        self.window.destroy()
+
+if _name_ == "_main_":
+    root = tk.Tk()
+    app = SurveillanceApp(root)
+    root.mainloop()
